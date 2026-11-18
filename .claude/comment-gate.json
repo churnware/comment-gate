@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "mode": "apply",
+  "model": null,
+  "reasoning_effort": "low",
+  "timeout_sec": 90
+}
