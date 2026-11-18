@@ -90,6 +90,7 @@ class CliTest(unittest.TestCase):
         self.assertIn("already on PATH", out)
         shims = sorted(p.name for p in self.bin.iterdir())
         self.assertIn("comment-gate", shims)
+        self.assertNotIn(b"\r", (self.bin / "comment-gate").read_bytes())
         if os.name == "nt":
             self.assertIn("comment-gate.cmd", shims)
             proc = subprocess.run([str(self.bin / "comment-gate.cmd"), "--version"], capture_output=True,

@@ -68,9 +68,10 @@ def register():
     written = []
     for shim in shims():
         if shim.suffix == ".cmd":
-            shim.write_text(f'@echo off\r\n"{py}" "{script}" %*\r\n', encoding="utf-8")
+            shim.write_bytes(f'@echo off\r\n"{py}" "{script}" %*\r\n'.encode("utf-8"))
         else:
-            shim.write_text(f'#!/bin/sh\nexec "{py.as_posix()}" "{script.as_posix()}" "$@"\n', encoding="utf-8")
+            # Bytes, not text: a CRLF after the shebang breaks the script in Git Bash.
+            shim.write_bytes(f'#!/bin/sh\nexec "{py.as_posix()}" "{script.as_posix()}" "$@"\n'.encode("utf-8"))
             shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         written.append(shim)
 
