@@ -41,8 +41,9 @@ def _root_hint(project):
 
 # --- commands ---------------------------------------------------------------
 
-def cmd_install(paths, shared=False, mode=None):
-    ui.heading("Install")
+def cmd_install(paths, shared=False, mode=None, title=True):
+    if title:
+        ui.heading("Install")
     projects = _resolve(paths)
     for project in projects:
         try:
@@ -52,19 +53,20 @@ def cmd_install(paths, shared=False, mode=None):
             ui.err(f"{ui.bold(ui.short(project))}: {e}")
             continue
         ui.ok(f"{ui.bold(ui.short(project))} {ui.dim('→')} .claude/{settings.name} "
-              f"{ui.dim('·')} mode {ui.cyan(cfg['mode'])}")
+              f"{ui.dim('·')} mode {ui.accent(cfg['mode'])}")
         if created:
             ui.hint(f"created .claude/{cfg_path.name} with defaults")
         _root_hint(project)
     if projects:
         print()
         ui.info(f"restart Claude Code sessions in {'this project' if len(projects) == 1 else 'these projects'} "
-                f"(or open {ui.cyan('/hooks')}) to activate")
+                f"(or open {ui.accent('/hooks')}) to activate")
     return 0 if projects else 1
 
 
-def cmd_uninstall(paths):
-    ui.heading("Uninstall")
+def cmd_uninstall(paths, title=True):
+    if title:
+        ui.heading("Uninstall")
     projects = _resolve(paths)
     for project in projects:
         changed = installer.uninstall(project)
@@ -93,12 +95,12 @@ def cmd_status(paths):
     ui.heading("Status")
     projects = _resolve(paths) if paths else installer.known_projects()
     if not projects:
-        ui.info("no projects yet: run " + ui.cyan("comment-gate install <path>"))
+        ui.info("no projects yet: run " + ui.accent("comment-gate install <path>"))
     width = max([len(ui.short(p)) for p in projects] + [7])
     for p, where, mode in _project_rows(projects):
         name = ui.short(p).ljust(width)
         if where:
-            colour = ui.yellow if mode in ("disabled", "report", "suggest") else ui.green
+            colour = ui.caution if mode in ("disabled", "report", "suggest") else ui.good
             ui.ok(f"{ui.bold(name)}  {colour(mode.ljust(8))} {ui.dim(', '.join(where))}")
         else:
             ui.err(f"{ui.bold(name)}  {ui.dim('not installed')}")
@@ -122,8 +124,9 @@ def _check(label, fn):
     return good is not False
 
 
-def cmd_doctor(live=False, project=None):
-    ui.heading("Doctor")
+def cmd_doctor(live=False, project=None, title=True):
+    if title:
+        ui.heading("Doctor")
     results = []
 
     def python():
@@ -172,9 +175,9 @@ def cmd_doctor(live=False, project=None):
         ui.hint("add --live for a real end-to-end review call")
     print()
     if all(results):
-        ui.ok(ui.green("all good"))
+        ui.ok(ui.good("all good"))
         return 0
-    ui.err(ui.red("some checks failed"))
+    ui.err(ui.bad("some checks failed"))
     return 1
 
 
@@ -219,16 +222,16 @@ def cmd_log(count=5):
         print()
         when = ui.dim(rec["ts"].replace("T", " "))
         if rec["event"] in ("review_failed", "error"):
-            ui.err(f"{when}  {ui.red(rec.get('error', 'error'))}")
+            ui.err(f"{when}  {ui.bad(rec.get('error', 'error'))}")
             continue
         summary = f"{rec.get('comments', 0)} reviewed · {len(rec.get('changes', []))} changed · {rec.get('seconds', '?')}s"
-        ui.ok(f"{when}  {ui.cyan(rec.get('mode', 'suggest'))}  {ui.dim(summary)}")
+        ui.ok(f"{when}  {ui.accent(rec.get('mode', 'suggest'))}  {ui.dim(summary)}")
         for c in rec.get("changes", []):
             print(f"    {ui.dim(c['file'] + ':' + str(c['line']))}  {ui.dim(ui.italic(c['reason']))}")
             for l in c["old"].splitlines():
-                print(f"      {ui.red('- ' + l)}")
+                print(f"      {ui.bad('- ' + l)}")
             for l in c["new"].splitlines():
-                print(f"      {ui.green('+ ' + l)}")
+                print(f"      {ui.good('+ ' + l)}")
     return 0
 
 
@@ -246,7 +249,7 @@ def cmd_register():
         ui.warn(f"{ui.short(pathreg.bin_dir())} is not on PATH; add this to your shell profile:")
         ui.hint('export PATH="$HOME/.local/bin:$PATH"')
     print()
-    ui.info(f"try it: {ui.cyan('comment-gate status')}")
+    ui.info(f"try it: {ui.accent('comment-gate status')}")
     return 0
 
 
@@ -266,9 +269,9 @@ def _pick_projects(question):
     known = installer.known_projects()
     if not known:
         return ui.ask_paths(question)
-    print(f"  {ui.magenta('?')} {ui.bold(question)}")
+    print(f"  {ui.accent('?')} {ui.foam(question)}")
     for i, p in enumerate(known, 1):
-        print(f"    {ui.gradient(f'[{i}]')} {ui.short(p)}")
+        print(f"    {ui.wave(f'[{i}]')} {ui.short(p)}")
     print(f"    {ui.dim('or type / drag in a path')}")
     while True:
         answer = ui.ask("Projects", "1")
@@ -281,38 +284,60 @@ def _pick_projects(question):
         ui.err("enter numbers from the list or existing folder paths")
 
 
+def _page(title=None, first=False):
+    """Clear the terminal and draw a fresh page so output never piles up."""
+    ui.clear()
+    ui.banner(VERSION, animate=first)
+    if title:
+        ui.heading(title)
+        print()
+
+
 def interactive():
-    ui.banner(VERSION)
-    menu = [
-        ("1", "Install into project(s)"),
-        ("2", "Uninstall from project(s)"),
-        ("3", "Status"),
-        ("4", "Doctor (add a live Codex check)"),
-        ("5", "Recent reviews"),
-        ("6", "Register `comment-gate` on PATH" if not pathreg.registered() else "Re-register `comment-gate` on PATH"),
-        ("q", "Quit"),
-    ]
+    first = True
     while True:
+        menu = [
+            ("1", "Install into project(s)"),
+            ("2", "Uninstall from project(s)"),
+            ("3", "Status"),
+            ("4", "Doctor"),
+            ("5", "Recent reviews"),
+            ("6", "Re-register on PATH" if pathreg.registered() else "Register `comment-gate` on PATH"),
+            ("q", "Quit"),
+        ]
+        _page(first=first)
+        first = False
         choice = ui.choose("What would you like to do?", menu, "1")
         if choice == "q":
-            print()
+            ui.clear()
             return 0
         if choice == "1":
+            _page("Install")
             paths = ui.ask_paths("Project folder(s) to protect", str(Path.cwd()))
             mode = ui.choose("Mode", [(m[0], f"{m.ljust(8)} {ui.dim(MODE_HELP[m])}") for m in MODES], "a")
             shared = ui.confirm("Commit hooks to the shared .claude/settings.json?", False)
-            cmd_install(paths, shared, next(m for m in MODES if m[0] == mode))
+            print()
+            cmd_install(paths, shared, next(m for m in MODES if m[0] == mode), title=False)
         elif choice == "2":
-            cmd_uninstall(_pick_projects("Which project(s)?"))
+            _page("Uninstall")
+            projects = _pick_projects("Which project(s)?")
+            print()
+            cmd_uninstall(projects, title=False)
         elif choice == "3":
+            _page()
             cmd_status([])
         elif choice == "4":
-            cmd_doctor(live=ui.confirm("Run a live review against Codex?", True))
+            _page("Doctor")
+            live = ui.confirm("Include a live review against Codex?", True)
+            print()
+            cmd_doctor(live=live, title=False)
         elif choice == "5":
+            _page()
             cmd_log()
         elif choice == "6":
+            _page()
             cmd_register()
-        print()
+        ui.pause()
 
 
 # --- entry ------------------------------------------------------------------

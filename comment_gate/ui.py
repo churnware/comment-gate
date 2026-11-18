@@ -2,6 +2,7 @@
 Colour degrades to plain text when output is not a terminal or NO_COLOR is set."""
 
 import itertools
+import math
 import os
 import re
 import shlex
@@ -34,7 +35,8 @@ def _enable_vt():
 
 
 TTY = sys.stdout.isatty()
-COLOR = bool(os.environ.get("FORCE_COLOR")) or (TTY and not os.environ.get("NO_COLOR") and _enable_vt())
+VT = TTY and _enable_vt()
+COLOR = bool(os.environ.get("FORCE_COLOR")) or (VT and not os.environ.get("NO_COLOR"))
 TRUECOLOR = COLOR and (
     os.environ.get("COLORTERM") in ("truecolor", "24bit")
     or "WT_SESSION" in os.environ
@@ -56,33 +58,56 @@ def rgb(color, s):
     return f"\x1b[38;5;{16 + 36 * round(r / 51) + 6 * round(g / 51) + round(b / 51)}m{s}\x1b[0m"
 
 
+# Water palette: muted blues with white highlights. Status colours stay in
+# the same family but remain distinguishable (coral for errors, sand for warnings).
+DEEP = (46, 74, 112)
+TIDE = (78, 118, 160)
+MIST = (138, 172, 204)
+FOAM = (236, 243, 250)
+SAND = (214, 192, 146)
+CORAL = (214, 128, 122)
+
+
 def bold(s): return _sgr("1", s)
-def dim(s): return _sgr("2", s)
+def dim(s): return rgb(TIDE, s)
 def italic(s): return _sgr("3", s)
-def red(s): return _sgr("91", s)
-def green(s): return _sgr("92", s)
-def yellow(s): return _sgr("93", s)
-def cyan(s): return _sgr("96", s)
-def magenta(s): return _sgr("95", s)
+def accent(s): return rgb(MIST, s)
+def foam(s): return _sgr("1", rgb(FOAM, s)) if COLOR else s
+def good(s): return rgb(FOAM, s)
+def caution(s): return rgb(SAND, s)
+def bad(s): return rgb(CORAL, s)
 
 
 def visible_len(s):
     return len(ANSI.sub("", s))
 
 
-# Gradient endpoints shared by the banner and accents.
-TEAL, VIOLET = (0, 214, 255), (178, 92, 255)
-
-
 def _mix(a, b, t):
     return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
 
 
-def gradient(s, start=TEAL, end=VIOLET):
+def _water(t):
+    """Colour for wave height t in [0, 1]: deep water rising to white foam."""
+    if t < 0.7:
+        return _mix(DEEP, MIST, t / 0.7)
+    return _mix(MIST, FOAM, (t - 0.7) / 0.3)
+
+
+def wave(s, row=0, phase=0.0):
+    """Colour `s` as a diagonal swell; crests catch white highlights."""
     if not COLOR:
         return s
-    n = max(1, len(s) - 1)
-    return "".join(rgb(_mix(start, end, i / n), ch) if ch != " " else ch for i, ch in enumerate(s))
+    out = []
+    for i, ch in enumerate(s):
+        if ch == " ":
+            out.append(ch)
+            continue
+        t = 0.5 + 0.5 * math.sin(i * 0.32 - row * 0.8 + phase)
+        out.append(rgb(_water(t ** 1.6), ch))
+    return "".join(out)
+
+
+gradient = wave
 
 
 # "Calvin S" figlet glyphs, three rows each.
@@ -92,27 +117,46 @@ _GLYPHS = {
     "G": ("╔═╗", "║ ╦", "╚═╝"), "A": ("╔═╗", "╠═╣", "╩ ╩"), " ": ("  ", "  ", "  "),
 }
 
-_GATE = ("┌┬┬┬┐", "│││││", "┴┴┴┴┴")
+# A sluice gate standing in water.
+_GATE = ("┌┬┬┬┐", "│││││", "≈≈≈≈≈")
 
 
-def banner(version, subtitle="keep the why · drop the noise"):
+def _banner_lines(version, subtitle, phase):
     word = "COMMENT GATE"
     rows = ["".join(_GLYPHS[c][r] for c in word) for r in range(3)]
-    print()
-    for gate_row, row in zip(_GATE, rows):
-        print("  " + rgb(VIOLET, gate_row) + "   " + gradient(row))
+    lines = []
+    for r, (gate_row, row) in enumerate(zip(_GATE, rows)):
+        gate = wave(gate_row, r + 2, phase * 1.4) if r == 2 else rgb(DEEP, gate_row)
+        lines.append("  " + gate + "   " + wave(row, r, phase))
     width = len(rows[0]) + len(_GATE[0]) + 3
-    tag = f" {subtitle} "
+    tag = f"  {subtitle}  "
     side = max(2, (width - len(tag)) // 2)
-    print("  " + dim("─" * side) + italic(cyan(tag)) + dim("─" * (width - side - len(tag))))
-    print("  " + dim(f"v{version} · claude code ⟶ codex review"))
+    ripple = "∼" * width
+    lines.append("  " + wave(ripple[:side], 3, phase * 1.2) + italic(foam(tag))
+                 + wave(ripple[side + len(tag):], 3, phase * 1.2 + side * 0.32))
+    lines.append("  " + dim(f"v{version} · claude code ⟶ codex review"))
+    return lines
+
+
+def banner(version, subtitle="drop the noise", animate=True):
+    print()
+    animate = animate and COLOR and TTY and not os.environ.get("COMMENT_GATE_NO_ANIM")
+    frames = 14 if animate else 1
+    for f in range(frames):
+        lines = _banner_lines(version, subtitle, f * 0.45)
+        if f:
+            sys.stdout.write(f"\x1b[{len(lines)}A")
+        sys.stdout.write("\n".join(l + "\x1b[K" if COLOR else l for l in lines) + "\n")
+        sys.stdout.flush()
+        if animate and f < frames - 1:
+            time.sleep(0.045)
     print()
 
 
-def box(lines, title=None, color=cyan, pad=1):
+def box(lines, title=None, color=accent, pad=1):
     width = max([visible_len(l) for l in lines] + [visible_len(title) + 4 if title else 0]) + pad * 2
     if title:
-        print("  " + color("╭─ ") + bold(title) + color(f" {'─' * (width - visible_len(title) - 3)}╮"))
+        print("  " + color("╭─ ") + foam(title) + color(f" {'─' * (width - visible_len(title) - 3)}╮"))
     else:
         print("  " + color(f"╭{'─' * width}╮"))
     for l in lines:
@@ -120,20 +164,34 @@ def box(lines, title=None, color=cyan, pad=1):
     print("  " + color(f"╰{'─' * width}╯"))
 
 
-def ok(msg): print(f"  {green('✔')} {msg}")
-def warn(msg): print(f"  {yellow('▲')} {msg}")
-def err(msg): print(f"  {red('✖')} {msg}")
-def info(msg): print(f"  {cyan('•')} {msg}")
+def ok(msg): print(f"  {good('✔')} {msg}")
+def warn(msg): print(f"  {caution('▲')} {msg}")
+def err(msg): print(f"  {bad('✖')} {msg}")
+def info(msg): print(f"  {accent('∘')} {msg}")
 def hint(msg): print(f"    {dim('↳ ' + msg)}")
 
 
 def heading(title):
     print()
-    print("  " + gradient(f"◆ {title}"))
+    print("  " + wave("≈ ", 1) + foam(title))
+
+
+def clear():
+    """Start a fresh page: wipe the screen and scrollback."""
+    if VT:
+        sys.stdout.write("\x1b[2J\x1b[3J\x1b[H")
+        sys.stdout.flush()
+
+
+def pause(msg="enter to return to the menu"):
+    try:
+        input(f"\n  {dim('↵ ' + msg)} ")
+    except EOFError:
+        pass
 
 
 def short(path):
-    """Display a path with the home directory abbreviated to ~."""
+    """Return a path string with the home directory abbreviated to ~."""
     p, home = Path(path), Path.home()
     try:
         return "~" + os.sep + str(p.relative_to(home))
@@ -142,7 +200,7 @@ def short(path):
 
 
 class Spinner:
-    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    WIDTH = 6
 
     def __init__(self, text):
         self.text, self._stop, self._t = text, threading.Event(), None
@@ -152,16 +210,17 @@ class Spinner:
             self._t = threading.Thread(target=self._run, daemon=True)
             self._t.start()
         else:
-            print(f"  … {self.text}")
+            print(f"  ≈ {self.text}")
         return self
 
     def _run(self):
         start = time.monotonic()
-        for frame in itertools.cycle(self.FRAMES):
+        for tick in itertools.count():
             if self._stop.is_set():
                 break
             elapsed = dim(f"{time.monotonic() - start:4.1f}s")
-            sys.stdout.write(f"\r  {gradient(frame)} {self.text} {elapsed}")
+            swell = wave("≈" * self.WIDTH, 0, -tick * 0.5)
+            sys.stdout.write(f"\r  {swell} {self.text} {elapsed}")
             sys.stdout.flush()
             time.sleep(0.08)
 
@@ -169,14 +228,14 @@ class Spinner:
         self._stop.set()
         if self._t:
             self._t.join()
-            sys.stdout.write("\r\x1b[2K" if COLOR else "\r" + " " * (visible_len(self.text) + 12) + "\r")
+            sys.stdout.write("\r\x1b[2K" if COLOR else "\r" + " " * (visible_len(self.text) + self.WIDTH + 10) + "\r")
             sys.stdout.flush()
 
 
 def ask(question, default=None):
     suffix = f" {dim(f'[{default}]')}" if default else ""
     try:
-        answer = input(f"  {magenta('?')} {bold(question)}{suffix} {cyan('›')} ").strip()
+        answer = input(f"  {accent('?')} {foam(question)}{suffix} {accent('›')} ").strip()
     except EOFError:
         answer = ""
     return answer or (default or "")
@@ -190,10 +249,10 @@ def confirm(question, default=False):
 
 def choose(question, options, default=None):
     """options: [(key, label)] -> chosen key."""
-    print(f"  {magenta('?')} {bold(question)}")
-    for key, label in options:
-        marker = cyan("›") if key == default else " "
-        print(f"    {marker} {gradient(f'[{key}]')} {label}")
+    print(f"  {accent('?')} {foam(question)}")
+    for i, (key, label) in enumerate(options):
+        marker = foam("›") if key == default else " "
+        print(f"    {marker} {wave(f'[{key}]', i)} {label}")
     keys = {k.lower() for k, _ in options}
     while True:
         answer = ask("Choose", default).lower()
@@ -212,7 +271,7 @@ def split_paths(raw):
         parts = shlex.split(raw, posix=False)
     except ValueError:
         parts = [raw]
-    # Unquoted Windows paths containing spaces split badly; fall back to the whole line.
+    # If an unquoted Windows path splits at spaces, use the whole line only if it resolves to an existing path.
     if len(parts) > 1 and not any(c in raw for c in "\"'") and Path(os.path.expandvars(os.path.expanduser(raw))).exists():
         parts = [raw]
     return [Path(os.path.expandvars(os.path.expanduser(p.strip("\"'")))) for p in parts]

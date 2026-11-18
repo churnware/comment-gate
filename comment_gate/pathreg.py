@@ -1,5 +1,6 @@
-"""Register the `comment-gate` command on PATH via small launcher shims in
-~/.local/bin (a conventional per-user bin directory)."""
+"""Register `comment-gate` on PATH via launcher shims. The default
+location is ~/.local/bin, a conventional per-user bin directory.
+"""
 
 import os
 import stat
