@@ -27,13 +27,20 @@ Codex runs with `--ephemeral --ignore-user-config -s read-only` in an empty temp
 Requirements: Python 3.9+ and the Codex CLI logged in (`codex login`). The gate looks for Codex in this order: `codex_path` in the config, then `codex` on PATH, then the binary bundled with the OpenAI VS Code extension.
 
 ```sh
-python install.py /path/to/project            # writes .claude/settings.local.json (personal, not committed)
-python install.py /path/to/project --shared   # writes .claude/settings.json instead
-python install.py /path/to/project --status   # shows install location, effective config and the resolved codex path
-python install.py /path/to/project --uninstall
+python comment-gate.py register   # puts `comment-gate` on PATH (shims in ~/.local/bin)
+comment-gate                      # interactive menu
 ```
 
-The installer merges into your existing settings and leaves other hooks in place. It also creates `.claude/comment-gate.json` if that file doesn't exist. Restart the Claude Code session (or run `/hooks`) to pick the hooks up.
+| Command | What it does |
+|---|---|
+| `comment-gate install [PATH...]` | Adds the hooks to one or more projects (default: the current directory). `--mode apply\|suggest\|report` sets the mode. `--shared` writes `.claude/settings.json` instead of the personal `settings.local.json` |
+| `comment-gate uninstall [PATH...]` | Removes the hooks and leaves your other hooks alone |
+| `comment-gate status [PATH...]` | Shows install state and mode for every project you've installed into, plus the Codex and PATH status |
+| `comment-gate doctor [--live]` | Checks Python, the Codex binary, auth, PATH and the state directory. `--live` also runs a real review call |
+| `comment-gate log [-n N]` | Shows recent reviews as coloured diffs, each with its reason |
+| `comment-gate register` / `unregister` | Adds or removes the PATH shims. On Windows, `register` also adds `~/.local/bin` to your user PATH if it's missing |
+
+Paths can be typed, pasted or dragged into the terminal. Quote any path that contains spaces, and use `~` and environment variables freely. The installer merges into your existing settings and creates `.claude/comment-gate.json` if that file doesn't exist. Restart the Claude Code session (or open `/hooks`) to pick the hooks up. Colour is disabled automatically when output isn't a terminal or `NO_COLOR` is set.
 
 ## Configuration: `<project>/.claude/comment-gate.json`
 
