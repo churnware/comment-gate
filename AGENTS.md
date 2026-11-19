@@ -1,4 +1,4 @@
-# claude-comment-gate
+# comment-gate
 
 An automatic comment-quality gate for Claude Code. When Claude finishes a turn, an independent OpenAI model (via the Codex CLI and your existing Codex login) reviews only the comments Claude **added or modified**. It removes redundant, obvious, conversational and misleading comments, tightens verbose ones, and keeps rationale, constraints, invariants, caveats, API docs and tool directives.
 
