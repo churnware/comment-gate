@@ -4,13 +4,19 @@ Lexers return raw comment spans (character offsets into the original text,
 CRLF preserved). `units()` groups adjacent full-line comments into reviewable
 units and computes their marker-free body text."""
 
+from __future__ import annotations
+
 import ast
 import inspect
 import io
 import re
 import tokenize
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, TypeAlias
+
+Kind: TypeAlias = Literal["line", "block", "doc"]
 
 
 class Unsupported(Exception):
@@ -19,9 +25,10 @@ class Unsupported(Exception):
 
 @dataclass(frozen=True)
 class Spec:
-    line: tuple = ()
-    blocks: tuple = ()
-    quotes: tuple = ('"', "'")
+    line: tuple[str, ...] = ()
+    # (opener, closer) pairs.
+    blocks: tuple[tuple[str, str], ...] = ()
+    quotes: tuple[str, ...] = ('"', "'")
     backtick: bool = False
     regex: bool = False
     triple: bool = False
@@ -30,7 +37,7 @@ class Spec:
 
 
 C = Spec(line=("//",), blocks=(("/*", "*/"),), triple=True)
-FAMILIES = {
+FAMILIES: dict[str, Spec] = {
     "c": C,
     "js": Spec(line=("//",), blocks=(("/*", "*/"),), backtick=True, regex=True),
     "go": Spec(line=("//",), blocks=(("/*", "*/"),), backtick=True),
@@ -43,7 +50,7 @@ FAMILIES = {
     "markup": Spec(blocks=(("<!--", "-->"),), quotes=()),
 }
 
-EXTENSIONS = {
+EXTENSIONS: dict[str, str] = {
     "python": "py pyi pyw",
     "js": "js mjs cjs jsx ts tsx mts cts",
     "c": "c h cc cpp cxx hpp hh hxx cs java kt kts swift scala dart php groovy m mm proto rs zig v sol scss less",
@@ -59,7 +66,7 @@ EXTENSIONS = {
 EXT_TO_LANG = {ext: lang.strip() for lang, exts in EXTENSIONS.items() for ext in exts.split()}
 
 
-def language_for(path):
+def language_for(path: str | Path) -> str | None:
     p = Path(path)
     ext = p.suffix[1:].lower() if p.suffix else p.name.lower()
     return EXT_TO_LANG.get(ext)
@@ -67,17 +74,18 @@ def language_for(path):
 
 @dataclass
 class Raw:
-    kind: str  # "line" | "block" | "doc"
+    kind: Kind
     start: int
     end: int
     opener: str
     closer: str = ""
     prefix: str = ""
+    lang: str = ""  # family of an embedded block, e.g. "js" inside <script>
 
 
 @dataclass
 class Unit:
-    kind: str
+    kind: Kind
     opener: str
     closer: str
     prefix: str
@@ -88,16 +96,17 @@ class Unit:
     indent: str
     code_before: bool
     code_after: bool
-    parts: list = field(default_factory=list)
+    parts: list[Raw] = field(default_factory=list)
     body: str = ""
     terminated: bool = True
+    lang: str = ""
 
     @property
-    def standalone(self):
+    def standalone(self) -> bool:
         return not self.code_before and not self.code_after
 
 
-def _skip_string(text, i, q):
+def _skip_string(text: str, i: int, q: str) -> int:
     n = len(text)
     if q != "`" and text.startswith(q * 3, i):
         j = text.find(q * 3, i + 3)
@@ -116,7 +125,7 @@ def _skip_string(text, i, q):
     return n
 
 
-def _skip_regex(text, i):
+def _skip_regex(text: str, i: int) -> int:
     n, j, in_class = len(text), i + 1, False
     while j < n:
         ch = text[j]
@@ -138,12 +147,13 @@ def _skip_regex(text, i):
 _REGEX_PRECEDERS = set("(,=:[!&|?{};+-*%<>~^") | {""}
 
 
-def _lex_generic(text, spec):
-    out, i, n, prev = [], 0, len(text), ""
+def _lex_generic(text: str, spec: Spec) -> list[Raw]:
+    out: list[Raw] = []
+    i, n, prev = 0, len(text), ""
     blocks = sorted(spec.blocks, key=lambda b: -len(b[0]))
     quotes = spec.quotes + (("`",) if spec.backtick else ())
     while i < n:
-        hit = None
+        hit: Raw | None = None
         for op, cl in blocks:
             if text.startswith(op, i):
                 j = text.find(cl, i + len(op))
@@ -177,7 +187,7 @@ def _lex_generic(text, spec):
     return out
 
 
-def _line_offsets(text):
+def _line_offsets(text: str) -> list[int]:
     offs, pos = [0], 0
     for line in text.split("\n"):
         pos += len(line) + 1
@@ -185,9 +195,9 @@ def _line_offsets(text):
     return offs
 
 
-def _lex_python(text):
+def _lex_python(text: str) -> list[Raw]:
     offs = _line_offsets(text)
-    out = []
+    out: list[Raw] = []
     try:
         for tok in tokenize.generate_tokens(io.StringIO(text).readline):
             if tok.type == tokenize.COMMENT:
@@ -202,7 +212,7 @@ def _lex_python(text):
         return out
     lines = text.split("\n")
 
-    def char_off(lineno, col_bytes):
+    def char_off(lineno: int, col_bytes: int) -> int:
         line = lines[lineno - 1]
         return offs[lineno - 1] + len(line.encode("utf-8")[:col_bytes].decode("utf-8", "ignore"))
 
@@ -214,8 +224,10 @@ def _lex_python(text):
         val = node.body[0].value
         if not (isinstance(val, ast.Constant) and isinstance(val.value, str)):
             continue
-        s, e = char_off(val.lineno, val.col_offset), char_off(val.end_lineno, val.end_col_offset)
-        raw = text[s:e]
+        if val.end_lineno is None or val.end_col_offset is None:
+            continue
+        s, end = char_off(val.lineno, val.col_offset), char_off(val.end_lineno, val.end_col_offset)
+        raw = text[s:end]
         m = re.match(r"([rRuU]?)(\"\"\"|'''|\"|')", raw)
         # Implicitly concatenated or otherwise unusual literals are left alone.
         if not m or not raw.endswith(m.group(2)) or len(raw) < len(m.group(0)) + len(m.group(2)):
@@ -225,21 +237,72 @@ def _lex_python(text):
                 continue
         except (ValueError, SyntaxError):
             continue
-        out.append(Raw("doc", s, e, m.group(2), m.group(2), m.group(1)))
+        out.append(Raw("doc", s, end, m.group(2), m.group(2), m.group(1)))
     out.sort(key=lambda r: r.start)
     return out
 
 
-def lex(text, lang):
+_EMBED = re.compile(r"<(script|style)\b([^>]*)>", re.IGNORECASE)
+_EMBED_ATTR = re.compile(r"""\b(type|lang)\s*=\s*["']?([^"'\s>]+)""", re.IGNORECASE)
+_JS_LANGS = {"js", "jsx", "ts", "tsx", "javascript", "typescript"}
+
+
+def _embedded_family(tag: str, attrs: str) -> str | None:
+    """Return the lexer family for a <script> or <style> body, or None for
+    unsupported bodies such as JSON, templates, and Sass.
+    """
+    vals = {k.lower(): v.lower() for k, v in _EMBED_ATTR.findall(attrs)}
+    if tag == "style":
+        return {"css": "css", "postcss": "css", "scss": "c", "less": "c"}.get(vals.get("lang", "css"))
+    if "lang" in vals:
+        return "js" if vals["lang"] in _JS_LANGS else None
+    kind = vals.get("type", "")
+    if kind in ("", "module", "text/babel", "text/jsx") or "javascript" in kind or "ecmascript" in kind:
+        return "js"
+    return None
+
+
+def _lex_markup(text: str) -> list[Raw]:
+    """Lex HTML comments and comments in supported <script> and <style> bodies."""
+    out: list[Raw] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text.find("<!--", i)
+        m = _EMBED.search(text, i)
+        if c >= 0 and (m is None or c < m.start()):
+            j = text.find("-->", c + 4)
+            end = n if j < 0 else j + 3
+            out.append(Raw("block", c, end, "<!--", "-->"))
+            i = end
+            continue
+        if m is None:
+            break
+        if m.group(2).rstrip().endswith("/"):
+            i = m.end()
+            continue
+        tag = m.group(1).lower()
+        close = re.compile(rf"</{tag}\s*>", re.IGNORECASE).search(text, m.end())
+        body_end = close.start() if close else n
+        family = _embedded_family(tag, m.group(2))
+        if family:
+            for r in _lex_generic(text[m.end() : body_end], FAMILIES[family]):
+                out.append(Raw(r.kind, r.start + m.end(), r.end + m.end(), r.opener, r.closer, r.prefix, family))
+        i = close.end() if close else n
+    return out
+
+
+def lex(text: str, lang: str) -> list[Raw]:
     if lang == "python":
         return _lex_python(text)
+    if lang == "markup":
+        return _lex_markup(text)
     spec = FAMILIES.get(lang)
     if spec is None:
         raise Unsupported(f"no lexer for {lang}")
     return _lex_generic(text, spec)
 
 
-def _line_marker(text, raw):
+def _line_marker(text: str, raw: Raw) -> str:
     """Extend a line marker over doc-style repeats: `///`, `//!`, `###`, `---`."""
     m, j = raw.opener, raw.start + len(raw.opener)
     while j < raw.end and (text[j] == m[-1] or (m.startswith("//") and text[j] == "!" and len(m) == 2)):
@@ -248,7 +311,7 @@ def _line_marker(text, raw):
     return m
 
 
-def _block_opener(text, raw):
+def _block_opener(text: str, raw: Raw) -> str:
     if raw.opener == "/*":
         nxt = text[raw.start + 2 : raw.start + 4]
         if nxt[:1] in ("*", "!") and nxt != "*/":
@@ -256,12 +319,12 @@ def _block_opener(text, raw):
     return raw.opener
 
 
-def _block_body(inner):
+def _block_body(inner: str) -> str:
     lines = [l.rstrip() for l in inner.replace("\r", "").split("\n")]
     rest = [l for l in lines[1:] if l.strip()]
     star = bool(rest) and all(l.lstrip().startswith("*") for l in rest)
     out = [lines[0].strip()]
-    tail = []
+    tail: list[str] = []
     for l in lines[1:]:
         if star:
             s = l.lstrip()[1:] if l.lstrip().startswith("*") else l.lstrip()
@@ -277,15 +340,15 @@ def _block_body(inner):
     return "\n".join(out)
 
 
-def units(text, lang, group_key=None):
+def units(text: str, lang: str, group_key: Callable[[int], Hashable] | None = None) -> list[Unit]:
     """Comment units in `text`. Adjacent full-line comments are merged only
     when `group_key(line)` agrees, so old and new comments stay separate."""
     raws = lex(text, lang)
-    group_key = group_key or (lambda _line: None)
+    key: Callable[[int], Hashable] = group_key or (lambda _line: None)
     offs = _line_offsets(text)
     n = len(text)
 
-    def line_of(pos):
+    def line_of(pos: int) -> int:
         lo, hi = 0, len(offs) - 1
         while lo < hi:
             mid = (lo + hi + 1) // 2
@@ -295,18 +358,18 @@ def units(text, lang, group_key=None):
                 hi = mid - 1
         return lo + 1
 
-    def line_end(lineno):
+    def line_end(lineno: int) -> int:
         e = min(offs[lineno] - 1, n) if lineno < len(offs) else n
         return e - 1 if text[e - 1 : e] == "\r" else e
 
-    out = []
+    out: list[Unit] = []
     for r in raws:
         line, end_line = line_of(r.start), line_of(max(r.start, r.end - 1))
         ls = offs[line - 1]
         before = text[ls : r.start]
         after = text[r.end : line_end(end_line)]
         code_before = bool(before.strip())
-        indent = re.match(r"[ \t]*", before).group()
+        indent = before[: len(before) - len(before.lstrip(" \t"))]
         opener = r.opener
         if r.kind == "line":
             opener = _line_marker(text, r)
@@ -322,7 +385,7 @@ def units(text, lang, group_key=None):
             and prev.opener == opener
             and prev.indent == indent
             and prev.end_line + 1 == line
-            and group_key(prev.end_line) == group_key(line)
+            and key(prev.end_line) == key(line)
         ):
             prev.parts.append(r)
             prev.end, prev.end_line = r.end, end_line
@@ -330,12 +393,12 @@ def units(text, lang, group_key=None):
         out.append(
             Unit(r.kind, opener, r.closer, r.prefix, r.start, r.end, line, end_line, indent,
                  code_before, bool(after.strip()), [r],
-                 terminated=r.kind == "line" or text.endswith(r.closer, 0, r.end))
+                 terminated=r.kind == "line" or text.endswith(r.closer, 0, r.end), lang=r.lang)
         )
 
     for u in out:
         if u.kind == "line":
-            body = []
+            body: list[str] = []
             for p in u.parts:
                 s = text[p.start + len(u.opener) : p.end]
                 body.append((s[1:] if s.startswith(" ") else s).rstrip())
@@ -351,7 +414,7 @@ def units(text, lang, group_key=None):
 
 # Comments that tools, compilers or legal requirements depend on. Units
 # matching any of these (in raw text or body) are never sent for review.
-DIRECTIVES = [
+DIRECTIVES: list[str] = [
     r"^#!", r"coding[:=]", r"-\*-.*-\*-", r"\bvim?:\s*(set\b|\w+=)",
     r"\beslint(-disable|-enable|-env)?\b", r"\bjshint\b", r"^\s*globals?\s+[\w$]+\s*(?:[:,]|$)",
     r"@ts-(ignore|expect-error|nocheck|check)\b",
@@ -368,7 +431,7 @@ DIRECTIVES = [
 ]
 
 
-def protected(unit, text, extra_patterns=()):
+def protected(unit: Unit, text: str, extra_patterns: Iterable[str] = ()) -> bool:
     raw = text[unit.start : unit.end]
     flags = re.IGNORECASE | re.MULTILINE
     return any(

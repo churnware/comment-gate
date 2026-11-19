@@ -52,6 +52,9 @@ class CliTest(unittest.TestCase):
         self.assertEqual(len(stop_cmds), 2)
         self.assertIn("node other-tool.js", stop_cmds)
         self.assertTrue(any(c.endswith("hook.py\" review") for c in stop_cmds))
+        sub_cmds = [h["command"] for g in s["hooks"]["SubagentStop"] for h in g["hooks"]]
+        self.assertEqual(len(sub_cmds), 1)
+        self.assertTrue(sub_cmds[0].endswith("hook.py\" review"))
         pre = [g for g in s["hooks"]["PreToolUse"] if g["matcher"] == "Write|Edit|MultiEdit"]
         self.assertEqual(len(pre), 1)
         self.assertTrue((self.project / ".claude" / "comment-gate.json").is_file())

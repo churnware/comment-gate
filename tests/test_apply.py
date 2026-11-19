@@ -49,6 +49,45 @@ class ApplyTests(unittest.TestCase):
         new, *_ = run("# Here we now compute it\nx = 1\n", "python", ("Here", "rewrite", "# Compute x."))
         self.assertEqual(new, "# Compute x.\nx = 1\n")
 
+    def test_rewrite_rewraps_to_original_width(self):
+        src = ("    // The canvas keeps a fixed logical size; we only scale its backing\n"
+               "    // store for high-DPI screens. CSS fits it to the window.\n    f();\n")
+        text = ("The canvas keeps a fixed logical size. Backing-store scaling handles high-DPI "
+                "screens, and CSS fits the canvas to the window.")
+        new, ok, _ = run(src, "js", ("canvas", "rewrite", text))
+        self.assertEqual(ok, 1)
+        lines = new.splitlines()[:-1]
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all(l.startswith("    // ") and len(l) <= 74 for l in lines), lines)
+        self.assertEqual(" ".join(l[7:] for l in lines), text)
+
+    def test_rewrite_wraps_long_single_line_at_80(self):
+        new, *_ = run("# short note\nx = 1\n", "python", ("short", "rewrite", "word " * 30))
+        self.assertTrue(all(len(l) <= 80 for l in new.splitlines()))
+        self.assertGreater(len(new.splitlines()), 2)
+
+    def test_rewrite_leaves_indented_lines_and_trailing_alone(self):
+        long = "x" * 100
+        new, *_ = run("// a\n// b\nf();\n", "js", ("a", "rewrite", f"Example:\n    {long}"))
+        self.assertIn(f"//     {long}\n", new)
+        new, *_ = run("f(); // a\n", "js", ("a", "rewrite", "word " * 30))
+        self.assertEqual(len(new.splitlines()), 1)
+
+    def test_rewrite_list_items_get_hanging_indent(self):
+        new, *_ = run("// a\n// b\nf();\n", "js", ("a", "rewrite", "- " + "item text " * 12))
+        lines = new.splitlines()[:-1]
+        self.assertTrue(lines[0].startswith("// - "))
+        self.assertTrue(all(l.startswith("//   ") for l in lines[1:]), lines)
+
+    def test_rewrite_straightens_smart_quotes(self):
+        lq, rq, apos = chr(0x201C), chr(0x201D), chr(0x2019)
+        new, *_ = run("// the arrow length\nf();\n", "js",
+                      ("arrow", "rewrite", f"The arrow{apos}s length, {lq}spin{rq}."))
+        self.assertEqual(new, "// The arrow's length, \"spin\".\nf();\n")
+        src = f"// the arrow{apos}s length\nf();\n"
+        new, *_ = run(src, "js", ("arrow", "rewrite", f"The arrow{apos}s length."))
+        self.assertIn(apos, new)
+
     def test_rewrite_trailing_joins_lines(self):
         new, *_ = run("x = 1  # a b c\n", "python", ("a b", "rewrite", "one\ntwo"))
         self.assertEqual(new, "x = 1  # one two\n")

@@ -2,30 +2,33 @@
 
 Run with no arguments in a terminal for the interactive menu."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any, TypeAlias
 
-from . import config, installer, pathreg, reviewer, ui
+from . import config, configure, installer, models, pathreg, reviewer, ui
+from .config import Mode
+
+# A test check's outcome: passed (True), warning (None) or failed (False), and a detail.
+CheckResult: TypeAlias = tuple[bool | None, str]
 
 VERSION = "0.2.0"
-MODES = ("apply", "suggest", "report")
-MODE_HELP = {
-    "apply": "edit comments in place after each turn",
-    "suggest": "hand the edits back to Claude to apply",
-    "report": "only show what would change",
-}
+MODES, MODE_HELP = config.MODES, config.MODE_HELP
 
 
-def _resolve(paths):
+def _resolve(paths: Sequence[Path] | None) -> list[Path]:
     """Resolve CLI path arguments, defaulting to the current directory."""
-    out = []
-    for p in paths or ["."]:
-        p = Path(os.path.expandvars(os.path.expanduser(str(p)))).resolve()
+    out: list[Path] = []
+    for raw in paths or [Path(".")]:
+        p = Path(os.path.expandvars(os.path.expanduser(str(raw)))).resolve()
         if not p.is_dir():
             ui.err(f"not a directory: {p}")
             continue
@@ -33,7 +36,7 @@ def _resolve(paths):
     return out
 
 
-def _root_hint(project):
+def _root_hint(project: Path) -> None:
     root = installer.git_root(project)
     if root and root != project:
         ui.hint(f"inside the git repo {ui.short(root)}; Claude Code reads hooks from the folder it is opened in")
@@ -41,7 +44,8 @@ def _root_hint(project):
 
 # --- commands ---------------------------------------------------------------
 
-def cmd_install(paths, shared=False, mode=None, title=True):
+def cmd_install(paths: Sequence[Path] | None, shared: bool = False, mode: Mode | None = None,
+                title: bool = True) -> int:
     if title:
         ui.heading("Install")
     projects = _resolve(paths)
@@ -55,7 +59,7 @@ def cmd_install(paths, shared=False, mode=None, title=True):
         ui.ok(f"{ui.bold(ui.short(project))} {ui.dim('→')} .claude/{settings.name} "
               f"{ui.dim('·')} mode {ui.accent(cfg['mode'])}")
         if created:
-            ui.hint(f"created .claude/{cfg_path.name} with defaults")
+            ui.hint(f"created .claude/{cfg_path.name}; unset keys follow the global config")
         _root_hint(project)
     if projects:
         print()
@@ -64,7 +68,7 @@ def cmd_install(paths, shared=False, mode=None, title=True):
     return 0 if projects else 1
 
 
-def cmd_uninstall(paths, title=True):
+def cmd_uninstall(paths: Sequence[Path] | None, title: bool = True) -> int:
     if title:
         ui.heading("Uninstall")
     projects = _resolve(paths)
@@ -78,10 +82,11 @@ def cmd_uninstall(paths, title=True):
     return 0 if projects else 1
 
 
-def _project_rows(projects):
-    rows = []
+def _project_rows(projects: list[Path]) -> list[tuple[Path, list[str], str]]:
+    rows: list[tuple[Path, list[str], str]] = []
     for p in projects:
         where = installer.installed_in(p)
+        mode: str
         try:
             cfg = config.load(p)
             mode = cfg["mode"] if cfg["enabled"] else "disabled"
@@ -91,7 +96,7 @@ def _project_rows(projects):
     return rows
 
 
-def cmd_status(paths):
+def cmd_status(paths: Sequence[Path]) -> int:
     ui.heading("Status")
     projects = _resolve(paths) if paths else installer.known_projects()
     if not projects:
@@ -106,56 +111,58 @@ def cmd_status(paths):
             ui.err(f"{ui.bold(name)}  {ui.dim('not installed')}")
     print()
     try:
-        codex = " ".join(reviewer.find_codex({"codex_path": None}))
+        codex = " ".join(reviewer.find_codex(config.DEFAULTS.copy()))
         ui.info(f"codex   {ui.dim(ui.short(codex))}")
     except reviewer.ReviewError:
         ui.warn("codex   not found")
     ui.info(f"command {ui.dim('on PATH' if pathreg.registered() else 'not registered (comment-gate register)')}")
+    ui.info(f"global  {ui.dim(ui.short(config.file_path(None)))}"
+            + ("" if config.file_path(None).is_file() else ui.dim(" (not created; built-in defaults)")))
     ui.info(f"log     {ui.dim(ui.short(config.state_root() / 'log.jsonl'))}")
     return 0
 
 
-def _check(label, fn):
+def _check(label: str, fn: Callable[[], CheckResult]) -> bool:
     try:
         good, detail = fn()
-    except Exception as e:  # a doctor check must never crash the report
+    except Exception as e:  # a test check must never crash the report
         good, detail = False, str(e)
     (ui.ok if good is True else ui.warn if good is None else ui.err)(f"{label.ljust(12)} {ui.dim(detail)}")
     return good is not False
 
 
-def cmd_doctor(live=False, project=None, title=True):
+def cmd_test(live: bool = False, project: Path | None = None, title: bool = True) -> int:
     if title:
-        ui.heading("Doctor")
-    results = []
+        ui.heading("Test")
+    results: list[bool] = []
 
-    def python():
+    def python() -> CheckResult:
         v = sys.version_info
-        return v >= (3, 9), f"{v.major}.{v.minor}.{v.micro} {ui.short(sys.executable)}"
+        return v >= (3, 10), f"{v.major}.{v.minor}.{v.micro} {ui.short(sys.executable)}"
 
-    codex = []
+    codex: list[str] = []
 
-    def find():
-        cfg = config.load(project) if project else dict(config.DEFAULTS)
+    def find() -> CheckResult:
+        cfg = config.load(project) if project else config.DEFAULTS.copy()
         codex.extend(reviewer.find_codex(cfg))
         proc = subprocess.run(codex + ["--version"], capture_output=True, text=True, timeout=20)
         return proc.returncode == 0, f"{proc.stdout.strip() or proc.stderr.strip()} · {ui.short(codex[-1])}"
 
-    def auth():
-        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    def auth() -> CheckResult:
+        home = models.codex_home()
         if (home / "auth.json").is_file():
             return True, f"credentials in {ui.short(home)}"
         if os.environ.get("OPENAI_API_KEY"):
             return True, "OPENAI_API_KEY set"
         return False, "not logged in: run `codex login`"
 
-    def command():
+    def command() -> CheckResult:
         if not pathreg.registered():
             return None, "not registered: run `comment-gate register`"
         return True, f"shims in {ui.short(pathreg.bin_dir())}" + ("" if pathreg.on_path(pathreg.bin_dir())
                                                                  else " (open a new terminal)")
 
-    def state_dir():
+    def state_dir() -> CheckResult:
         root = config.state_root()
         root.mkdir(parents=True, exist_ok=True)
         probe = root / ".probe"
@@ -181,13 +188,13 @@ def cmd_doctor(live=False, project=None, title=True):
     return 1
 
 
-def _live_check(project):
+def _live_check(project: Path | None) -> bool:
     from . import comments
 
     sample = "let total = 0; // set total to zero\n// Here we now add up every price in the cart\nfor (const p of prices) total += p;\n"
     units = comments.units(sample, "js")
     items = [reviewer.build_item(f"c{i + 1}", "sample.js", "js", u, sample, 3) for i, u in enumerate(units)]
-    cfg = config.load(project) if project else dict(config.DEFAULTS)
+    cfg = config.load(project) if project else config.DEFAULTS.copy()
     t0 = time.monotonic()
     try:
         with ui.Spinner("asking codex to review 2 sample comments"):
@@ -202,19 +209,19 @@ def _live_check(project):
     return True
 
 
-def cmd_log(count=5):
+def cmd_log(count: int = 5) -> int:
     ui.heading("Recent reviews")
     log = config.state_root() / "log.jsonl"
     if not log.is_file():
         ui.info("nothing logged yet")
         return 0
-    records = []
+    records: list[dict[str, Any]] = []
     for line in log.read_text(encoding="utf-8").splitlines():
         try:
             rec = json.loads(line)
         except ValueError:
             continue
-        if rec.get("event") in ("reviewed", "suggested", "review_failed", "error"):
+        if isinstance(rec, dict) and rec.get("event") in ("reviewed", "suggested", "review_failed", "error"):
             records.append(rec)
     if not records:
         ui.info("nothing logged yet")
@@ -235,7 +242,7 @@ def cmd_log(count=5):
     return 0
 
 
-def cmd_register():
+def cmd_register() -> int:
     ui.heading("Register")
     shims, status = pathreg.register()
     for s in shims:
@@ -253,7 +260,7 @@ def cmd_register():
     return 0
 
 
-def cmd_unregister():
+def cmd_unregister() -> int:
     ui.heading("Unregister")
     removed = pathreg.unregister()
     for s in removed:
@@ -265,7 +272,7 @@ def cmd_unregister():
 
 # --- interactive ------------------------------------------------------------
 
-def _pick_projects(question):
+def _pick_projects(question: str) -> list[Path]:
     known = installer.known_projects()
     if not known:
         return ui.ask_paths(question)
@@ -284,60 +291,108 @@ def _pick_projects(question):
         ui.err("enter numbers from the list or existing folder paths")
 
 
-def _page(title=None, first=False):
+def _pick_target() -> Path | None:
+    """Global settings (None) or one project, chosen with the arrows or typed."""
+    known = installer.known_projects()
+    keys = [str(i) for i in range(1, len(known) + 1)]
+    cwd = Path.cwd().resolve()
+    default = next((k for k, p in zip(keys, known) if p == cwd), "g")
+    options: list[tuple[str, str]] = [("g", f"Global {ui.dim('· defaults for every project')}")]
+    options += list(zip(keys, map(ui.short, known))) + [("p", ui.dim("another folder…"))]
+    choice = ui.choose("What would you like to configure?", options, default)
+    if choice == "g":
+        return None
+    if choice == "p":
+        return ui.ask_paths("Project folder", str(cwd))[0]
+    return known[int(choice) - 1]
+
+
+def _page(title: str | None = None, first: bool = False) -> None:
     """Clear the terminal and draw a fresh page so output never piles up."""
     ui.clear()
     ui.banner(VERSION, animate=first)
     if title:
-        ui.heading(title)
+        ui.heading(title + "  " + ui.dim("esc to go back"))
         print()
 
 
-def interactive():
+def _install_page() -> None:
+    _page("Install")
+    paths = ui.ask_paths("Project folder(s) to protect", str(Path.cwd()))
+    modes: list[tuple[str, str]] = [("g", f"{'global'.ljust(8)} {ui.dim('follow the global mode')}")]
+    modes += [(m[0], f"{m.ljust(8)} {ui.dim(MODE_HELP[m])}") for m in MODES]
+    mode = ui.choose("Mode", modes, "g")
+    shared = ui.confirm("Commit hooks to the shared .claude/settings.json?", False)
+    print()
+    cmd_install(paths, shared, next((m for m in MODES if m[0] == mode), None), title=False)
+
+
+def _uninstall_page() -> None:
+    _page("Uninstall")
+    projects = _pick_projects("Which project(s)?")
+    print()
+    cmd_uninstall(projects, title=False)
+
+
+def _configure_page() -> None:
+    _page("Configure")
+    target = _pick_target()
+    _page("Configure")
+    configure.edit(target)
+
+
+def _test_page() -> None:
+    _page("Test")
+    live = ui.confirm("Include a live review against Codex?", True)
+    print()
+    cmd_test(live=live, title=False)
+
+
+def interactive() -> int:
     first = True
     while True:
         menu = [
             ("1", "Install into project(s)"),
             ("2", "Uninstall from project(s)"),
-            ("3", "Status"),
-            ("4", "Doctor"),
-            ("5", "Recent reviews"),
-            ("6", "Re-register on PATH" if pathreg.registered() else "Register `comment-gate` on PATH"),
+            ("3", "Configure"),
+            ("4", "Status"),
+            ("5", "Test"),
+            ("6", "Recent reviews"),
+            ("7", "Re-register on PATH" if pathreg.registered() else "Register `comment-gate` on PATH"),
             ("q", "Quit"),
         ]
         _page(first=first)
         first = False
-        choice = ui.choose("What would you like to do?", menu, "1")
+        try:
+            choice = ui.choose("What would you like to do?", menu, "1")
+        except ui.Back:
+            choice = "q"
         if choice == "q":
             ui.clear()
             return 0
-        if choice == "1":
-            _page("Install")
-            paths = ui.ask_paths("Project folder(s) to protect", str(Path.cwd()))
-            mode = ui.choose("Mode", [(m[0], f"{m.ljust(8)} {ui.dim(MODE_HELP[m])}") for m in MODES], "a")
-            shared = ui.confirm("Commit hooks to the shared .claude/settings.json?", False)
-            print()
-            cmd_install(paths, shared, next(m for m in MODES if m[0] == mode), title=False)
-        elif choice == "2":
-            _page("Uninstall")
-            projects = _pick_projects("Which project(s)?")
-            print()
-            cmd_uninstall(projects, title=False)
-        elif choice == "3":
-            _page()
-            cmd_status([])
-        elif choice == "4":
-            _page("Doctor")
-            live = ui.confirm("Include a live review against Codex?", True)
-            print()
-            cmd_doctor(live=live, title=False)
-        elif choice == "5":
-            _page()
-            cmd_log()
-        elif choice == "6":
-            _page()
-            cmd_register()
-        ui.pause()
+        try:
+            if choice == "1":
+                _install_page()
+            elif choice == "2":
+                _uninstall_page()
+            elif choice == "3":
+                # The editor is a page of its own; leaving it goes straight back to the menu.
+                _configure_page()
+                continue
+            elif choice == "4":
+                _page()
+                cmd_status([])
+            elif choice == "5":
+                _test_page()
+            elif choice == "6":
+                _page()
+                cmd_log()
+            elif choice == "7":
+                _page()
+                cmd_register()
+            ui.pause()
+        except ui.Back:
+            continue
 
 
 # --- entry ------------------------------------------------------------------
@@ -347,13 +402,15 @@ EPILOG = """examples:
   comment-gate install .               protect the current project
   comment-gate install ~/a "D:/My B"   several projects at once
   comment-gate install . --mode report try it without editing files
+  comment-gate config                  edit this project's settings
+  comment-gate config --global         edit the defaults for every project
   comment-gate status                  every project you've installed into
-  comment-gate doctor --live           verify codex end to end
+  comment-gate test --live             verify codex end to end
   comment-gate log -n 10               recent reviews as diffs
 """
 
 
-def build_parser():
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="comment-gate", description="Codex-reviewed comment quality gate for Claude Code.",
                                  epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-V", "--version", action="version", version=f"comment-gate {VERSION}")
@@ -367,10 +424,14 @@ def build_parser():
     p = sub.add_parser("uninstall", help="remove the hooks from project(s)")
     p.add_argument("paths", nargs="*", type=Path)
 
+    p = sub.add_parser("config", help="edit a project's settings, or the global ones")
+    p.add_argument("path", nargs="?", type=Path, default=Path("."), help="project folder (default: .)")
+    p.add_argument("--global", dest="glob", action="store_true", help="edit the defaults for every project")
+
     p = sub.add_parser("status", help="show projects, codex and PATH status")
     p.add_argument("paths", nargs="*", type=Path, help="default: all known projects")
 
-    p = sub.add_parser("doctor", help="check that everything needed is in place")
+    p = sub.add_parser("test", help="check that everything needed is in place")
     p.add_argument("--live", action="store_true", help="also make a real review call")
     p.add_argument("--project", type=Path, help="use this project's config for the codex call")
 
@@ -383,7 +444,7 @@ def build_parser():
     return ap
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     ap = build_parser()
     a = ap.parse_args(argv)
     try:
@@ -401,10 +462,16 @@ def main(argv=None):
             return cmd_install(a.paths, a.shared, a.mode)
         if a.cmd == "uninstall":
             return cmd_uninstall(a.paths)
+        if a.cmd == "config":
+            if ui.TTY:
+                ui.banner(VERSION)
+                ui.heading("Configure")
+                print()
+            return configure.edit(None if a.glob else a.path)
         if a.cmd == "status":
             return cmd_status(a.paths)
-        if a.cmd == "doctor":
-            return cmd_doctor(a.live, a.project.resolve() if a.project else None)
+        if a.cmd == "test":
+            return cmd_test(a.live, a.project.resolve() if a.project else None)
         if a.cmd == "log":
             return cmd_log(a.n)
         if a.cmd == "register":

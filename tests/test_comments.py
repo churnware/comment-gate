@@ -85,6 +85,26 @@ class ProtectionTests(unittest.TestCase):
         self.assertTrue(comments.protected(u, src, [r"^KEEP:"]))
 
 
+class MarkupEmbedTests(unittest.TestCase):
+    SRC = (
+        "<!-- page -->\n<style>\n  /* glow */\n  h1 { color: red; }\n</style>\n"
+        '<script type="application/json">{"a": "// not a comment"}</script>\n'
+        '<script src="x.js"/>\n'
+        '<script type="module">\n  // set up the loop\n  const s = "<!-- no -->"; /* inline */ run(s);\n</script>\n'
+        '<style lang="sass">\n  // sass is left alone\n</style>\n'
+        "<!-- tail -->\n"
+    )
+
+    def test_script_and_style_comments_extracted(self):
+        units = comments.units(self.SRC, "markup")
+        self.assertEqual([u.body for u in units], ["page", "glow", "set up the loop", "inline", "tail"])
+        self.assertEqual([u.lang for u in units], ["", "css", "js", "js", ""])
+
+    def test_vue_script_lang(self):
+        src = '<template><!-- t --></template>\n<script lang="ts">\n// typed\n</script>\n'
+        self.assertEqual(bodies(src, "markup"), ["t", "typed"])
+
+
 class DiffScopeTests(unittest.TestCase):
     def test_only_new_or_changed_comments(self):
         old = "// existing\nlet a = 1;\n// stays\n"

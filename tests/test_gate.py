@@ -67,10 +67,25 @@ class GateTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return json.loads(proc.stdout) if proc.stdout.strip() else None
 
-    def edit(self, content, path=None, tool="Edit"):
+    def edit(self, content, path=None, tool="Edit", agent=None):
         path = path or self.file
-        self.hook("snapshot", {"tool_name": tool, "tool_input": {"file_path": str(path)}})
+        payload = {"tool_name": tool, "tool_input": {"file_path": str(path)}}
+        if agent:
+            payload["agent_id"] = agent
+        self.hook("snapshot", payload)
         path.write_text(content, encoding="utf-8", newline="")
+
+    def hook_subagent_stop(self):
+        """Register the Stop and SubagentStop hooks as a current install does."""
+        p = self.project / ".claude" / "settings.local.json"
+        p.parent.mkdir(exist_ok=True)
+        cmd = {"hooks": [{"type": "command", "command": f'"python" "{HOOK.as_posix()}" review'}]}
+        p.write_text(json.dumps({"hooks": {"Stop": [cmd], "SubagentStop": [cmd]}}), encoding="utf-8")
+
+    def many(self, name, n):
+        path = self.project / "src" / name
+        self.edit("".join(f"// note {name} {i}\nf{i}();\n" for i in range(n)), path=path)
+        return path
 
     def ncalls(self):
         return len(self.calls.read_text(encoding="utf-8").splitlines()) if self.calls.exists() else 0
@@ -165,9 +180,88 @@ class GateTest(unittest.TestCase):
         nm.parent.mkdir()
         self.edit(EDITED, path=nm)
         self.edit("// x\n", path=self.project / "notes.unknownext")
-        self.edit(EDITED, path=Path(self.tmp.name) / "outside.js")
         self.assertIsNone(self.hook("review", {}))
         self.assertEqual(self.ncalls(), 0)
+
+    def test_outside_project_files_are_reported(self):
+        self.edit(EDITED, path=Path(self.tmp.name) / "outside.js")
+        self.edit("x\n", path=Path(self.tmp.name) / "outside.unknownext")
+        out = self.hook("review", {})
+        self.assertEqual(out["systemMessage"], "Comment gate: ignored 1 file outside the project (outside.js)")
+        self.assertEqual(self.ncalls(), 0)
+        self.assertIsNone(self.hook("review", {}))
+
+    # --- volume ------------------------------------------------------------
+
+    def test_large_reviews_split_across_parallel_calls(self):
+        self.config(max_comments=5)
+        self.env["FAKE_CODEX_RULES"] = json.dumps([{"match": "note", "action": "delete"}])
+        a, b = self.many("a.js", 8), self.many("b.js", 8)
+        out = self.hook("review", {})
+        self.assertEqual(self.ncalls(), 4)
+        self.assertNotIn("note", a.read_text(encoding="utf-8") + b.read_text(encoding="utf-8"))
+        self.assertIn("removed 16", out["systemMessage"])
+        self.assertIn("16 comments reviewed", out["systemMessage"])
+
+    def test_files_over_the_batch_limit_are_deferred(self):
+        self.config(max_comments=5, max_batches=1)
+        self.many("a.js", 4)
+        b = self.many("b.js", 3)
+        out = self.hook("review", {})
+        self.assertEqual(self.ncalls(), 1)
+        self.assertNotIn("note b.js", self.prompt(0))
+        self.assertIn("deferred 3 comments in 1 file to the next review", out["systemMessage"])
+        self.hook("review", {})
+        self.assertEqual(self.ncalls(), 2)
+        self.assertIn("note b.js", self.prompt(1))
+        self.assertNotIn("note a.js", self.prompt(1))
+        self.assertIsNone(self.hook("review", {}))
+        self.assertTrue(b.exists())
+
+    def test_single_file_over_every_limit_reports_dropped(self):
+        self.config(max_comments=5, max_batches=2)
+        self.many("a.js", 13)
+        out = self.hook("review", {})
+        self.assertEqual(self.ncalls(), 2)
+        self.assertIn("3 comments over the review limits not reviewed", out["systemMessage"])
+
+    # --- subagents ---------------------------------------------------------
+
+    def test_subagent_edits_reviewed_on_its_own_stop(self):
+        self.hook_subagent_stop()
+        sub = self.project / "src" / "sub.js"
+        self.edit(EDITED, path=sub, agent="agent-1")
+        self.edit(EDITED)
+        self.hook("review", {"hook_event_name": "Stop"})
+        self.assertEqual(self.ncalls(), 1)
+        self.assertNotIn("sub.js", self.prompt(0))
+        self.hook("review", {"hook_event_name": "SubagentStop", "agent_id": "agent-1"})
+        self.assertEqual(self.ncalls(), 2)
+        self.assertIn("sub.js", self.prompt(1))
+        self.assertNotIn("initialise sum", sub.read_text(encoding="utf-8"))
+
+    def test_subagent_stop_without_agent_id_does_nothing(self):
+        self.hook_subagent_stop()
+        self.edit(EDITED)
+        self.assertIsNone(self.hook("review", {"hook_event_name": "SubagentStop"}))
+        self.assertEqual(self.ncalls(), 0)
+
+    def test_subagent_deferrals_pass_to_the_main_agent(self):
+        self.hook_subagent_stop()
+        self.config(max_comments=5, max_batches=1)
+        for name, n in (("a.js", 4), ("b.js", 3)):
+            self.edit("".join(f"// note {name} {i}\nf{i}();\n" for i in range(n)),
+                      path=self.project / "src" / name, agent="agent-1")
+        self.hook("review", {"hook_event_name": "SubagentStop", "agent_id": "agent-1"})
+        self.hook("review", {"hook_event_name": "Stop"})
+        self.assertEqual(self.ncalls(), 2)
+        self.assertIn("note b.js", self.prompt(1))
+
+    def test_install_without_subagent_hook_reviews_everything_on_stop(self):
+        self.edit(EDITED, path=self.project / "src" / "sub.js", agent="agent-1")
+        self.hook("review", {"hook_event_name": "Stop"})
+        self.assertEqual(self.ncalls(), 1)
+        self.assertIn("sub.js", self.prompt(0))
 
     def test_failures_fail_open(self):
         self.config(timeout_sec=2)

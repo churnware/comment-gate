@@ -15,13 +15,30 @@ import time
 BEGIN, END = "<<<COMMENTS", "COMMENTS>>>"
 
 
+def _append_locked(path, line):
+    # Parallel reviews run several fakes at once, and on Windows concurrent
+    # appends to one file can overwrite each other.
+    lock = path + ".lock"
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL)
+            break
+        except FileExistsError:
+            time.sleep(0.005)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    finally:
+        os.close(fd)
+        os.remove(lock)
+
+
 def main():
     args = sys.argv[1:]
     prompt = sys.stdin.read()
     calls = os.environ.get("FAKE_CODEX_CALLS")
     if calls:
-        with open(calls, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"argv": args, "prompt": prompt}) + "\n")
+        _append_locked(calls, json.dumps({"argv": args, "prompt": prompt}) + "\n")
 
     mutate = os.environ.get("FAKE_CODEX_MUTATE")
     if mutate:
